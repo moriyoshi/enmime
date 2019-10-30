@@ -615,3 +615,39 @@ func fixUnescapedQuotes(hvalue string) string {
 func whiteSpaceRune(r rune) bool {
 	return r == ' ' || r == '\t' || r == '\r' || r == '\n'
 }
+
+// HeaderEncoder encodes a MIME header with the content encoding and charset associated to the implementation
+type HeaderEncoder interface {
+	Encode(startColumn int, headerValue string) (newColumn int, encoded string, err error)
+}
+
+type GenericHeaderEncoder struct {
+	wordEncoder mime.WordEncoder
+	charset     string
+	encoder     coding.Encoder
+}
+
+func NewGenericHeaderEncoder(wordEncoder mime.WordEncoder, charset string) (*GenericHeaderEncoder, error) {
+	encoder, err := coding.GetEncoder(charset)
+	if err != nil {
+		return nil, err
+	}
+	return &GenericHeaderEncoder{
+		wordEncoder: wordEncoder,
+		charset:     charset,
+		encoder:     encoder,
+	}, nil
+}
+
+// GenericHeaderEncoder() encodes the provided string into RFC2045/RFC2047
+// encoded headers.  Currently this implementation *does not* honor the column position
+// (which thus maintains the old behavior) while it is actually supposed to folding
+// the value into lines at word boundaries.
+func (e *GenericHeaderEncoder) Encode(startColumn int, v string) (int, string, error) {
+	textBytes, err := e.encoder(v)
+	if err != nil {
+		return startColumn, "", err
+	}
+	encoded := e.wordEncoder.Encode(e.charset, string(textBytes))
+	return startColumn + len(encoded), encoded, nil
+}

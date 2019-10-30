@@ -309,3 +309,19 @@ func FindCharsetInHTML(html string) string {
 	}
 	return ""
 }
+
+type Encoder func(string) ([]byte, error)
+
+// GetEncoder() returns a Transformer corresponding to the provided charset.
+func GetEncoder(charset string) (Encoder, error) {
+	csentry, ok := encodings[strings.ToLower(charset)]
+	if !ok {
+		return nil, fmt.Errorf("Unsupported charset %q", charset)
+	}
+	encoder := csentry.e.NewEncoder()
+	return func(s string) (textBytes []byte, err error) {
+		textBytes, _, err = transform.Bytes(encoder, []byte(s))
+		encoder.Reset()
+		return
+	}, nil
+}

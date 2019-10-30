@@ -3,6 +3,7 @@ package enmime
 import (
 	"bytes"
 	"errors"
+	"io"
 	"io/ioutil"
 	"mime"
 	"net/mail"
@@ -206,22 +207,30 @@ func (p MailBuilder) AddFileInline(path string) MailBuilder {
 	return p.AddInline(b, ctype, name, name)
 }
 
-// Build performs some basic validations, then constructs a tree of Part structs from the configured
-// MailBuilder.  It will set the Date header to now if it was not explicitly set.
-func (p MailBuilder) Build() (*Part, error) {
+func (p *MailBuilder) validate() error {
 	if p.err != nil {
-		return nil, p.err
+		return p.err
 	}
 	// Validations
 	if p.from.Address == "" {
-		return nil, errors.New("from not set")
+		return errors.New("from not set")
 	}
 	if p.subject == "" {
-		return nil, errors.New("subject not set")
+		return errors.New("subject not set")
 	}
 	if len(p.to)+len(p.cc)+len(p.bcc) == 0 {
-		return nil, errors.New("no recipients (to, cc, bcc) set")
+		return errors.New("no recipients (to, cc, bcc) set")
 	}
+	return nil
+}
+
+// Build performs some basic validations, then constructs a tree of Part structs from the configured
+// MailBuilder.  It will set the Date header to now if it was not explicitly set.
+func (p MailBuilder) Build() (*Part, error) {
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+
 	// Fully loaded structure; the presence of text, html, inlines, and attachments will determine
 	// how much is necessary:
 	//
@@ -307,15 +316,138 @@ func (p MailBuilder) Build() (*Part, error) {
 	return root, nil
 }
 
+// Encode() directly constructs and writes a encoded email with basic validations.
+// It will set the Date header to now if it was not explicitly set.
+func (p MailBuilder) Encode(w io.Writer) error {
+	if err := p.validate(); err != nil {
+		return err
+	}
+
+	// Fully loaded structure; the presence of text, html, inlines, and attachments will determine
+	// how much is necessary:
+	//
+	//  multipart/mixed
+	//  |- multipart/related
+	//  |  |- multipart/alternative
+	//  |  |  |- text/plain
+	//  |  |  `- text/html
+	//  |  `- inlines..
+	//  `- attachments..
+	//
+	// We build this tree starting at the leaves, re-rooting as needed.
+	encoder := DefaultEncoder
+	var root, part, textPart, htmlPart *Part
+	if p.text != nil || p.html == nil {
+		root = NewPart(ctTextPlain)
+		root.Content = p.text
+		root.Charset = utf8
+		textPart = root
+	}
+	if p.html != nil {
+		part = NewPart(ctTextHTML)
+		part.Content = p.html
+		part.Charset = utf8
+		htmlPart = part
+		if root == nil {
+			root = part
+		} else {
+			root.NextSibling = part
+		}
+	}
+	if p.text != nil && p.html != nil {
+		// Wrap Text & HTML bodies
+		part = root
+		root = NewPart(ctMultipartAltern)
+		root.AddChild(part)
+	}
+	if len(p.inlines) > 0 {
+		part = root
+		root = NewPart(ctMultipartRelated)
+		root.AddChild(part)
+		for _, ip := range p.inlines {
+			// Copy inline Part to isolate mutations
+			part = &Part{}
+			*part = *ip
+			part.Header = make(textproto.MIMEHeader)
+			root.AddChild(part)
+		}
+	}
+	if len(p.attachments) > 0 {
+		part = root
+		root = NewPart(ctMultipartMixed)
+		root.AddChild(part)
+		for _, ap := range p.attachments {
+			// Copy attachment Part to isolate mutations
+			part = &Part{}
+			*part = *ap
+			part.Header = make(textproto.MIMEHeader)
+			root.AddChild(part)
+		}
+	}
+	// Headers
+	var he HeaderEncoder
+	{
+		var primaryPart *Part
+		var err error
+		if textPart != nil {
+			primaryPart = textPart
+		} else {
+			primaryPart = htmlPart
+		}
+		he, err = encoder.headerEncoderFactory(encoder, primaryPart)
+		if err != nil {
+			return err
+		}
+	}
+	h := root.Header
+	h.Set(hnMIMEVersion, "1.0")
+	{
+		encoded, err := stringutil.StringizeAddress(he.Encode, 6, p.from)
+		if err != nil {
+			return err
+		}
+		h.Set("From", encoded)
+	}
+	h.Set("Subject", p.subject)
+	if len(p.to) > 0 {
+		encoded, err := stringutil.EncodeAwareJoinAddress(he.Encode, 4, p.to)
+		if err != nil {
+			return err
+		}
+		h.Set("To", encoded)
+	}
+	if len(p.cc) > 0 {
+		encoded, err := stringutil.EncodeAwareJoinAddress(he.Encode, 4, p.cc)
+		if err != nil {
+			return err
+		}
+		h.Set("Cc", encoded)
+	}
+	if p.replyTo.Address != "" {
+		encoded, err := stringutil.StringizeAddress(he.Encode, 10, p.replyTo)
+		if err != nil {
+			return err
+		}
+		h.Set("Reply-To", encoded)
+	}
+	date := p.date
+	if date.IsZero() {
+		date = time.Now()
+	}
+	h.Set("Date", date.Format(time.RFC1123Z))
+	for k, v := range p.header {
+		for _, s := range v {
+			h.Add(k, s)
+		}
+	}
+	return encoder.Encode(root, w)
+}
+
 // Send encodes the message and sends it via the SMTP server specified by addr.  Send uses
 // net/smtp.SendMail, and accepts the same authentication parameters.
 func (p MailBuilder) Send(addr string, a smtp.Auth) error {
 	buf := &bytes.Buffer{}
-	root, err := p.Build()
-	if err != nil {
-		return err
-	}
-	err = root.Encode(buf)
+	err := p.Encode(buf)
 	if err != nil {
 		return err
 	}

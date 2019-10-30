@@ -18,81 +18,56 @@ import (
 // from quoted-printable to base64 encoding.
 const b64Percent = 20
 
-type transferEncoding byte
+type TransferEncoding byte
 
 const (
-	te7Bit transferEncoding = iota
-	teQuoted
-	teBase64
+	TE7Bit TransferEncoding = iota
+	TEQuoted
+	TEBase64
 )
 
 var crnl = []byte{'\r', '\n'}
 
-// Encode writes this Part and all its children to the specified writer in MIME format.
-func (p *Part) Encode(writer io.Writer) error {
-	if p.Header == nil {
-		p.Header = make(textproto.MIMEHeader)
-	}
-	cte := p.setupMIMEHeaders()
-	// Encode this part.
-	b := bufio.NewWriter(writer)
-	p.encodeHeader(b)
-	if len(p.Content) > 0 {
-		b.Write(crnl)
-		if err := p.encodeContent(b, cte); err != nil {
-			return err
-		}
-	}
-	if p.FirstChild == nil {
-		return b.Flush()
-	}
-	// Encode children.
-	endMarker := []byte("\r\n--" + p.Boundary + "--")
-	marker := endMarker[:len(endMarker)-2]
-	c := p.FirstChild
-	for c != nil {
-		b.Write(marker)
-		b.Write(crnl)
-		if err := c.Encode(b); err != nil {
-			return err
-		}
-		c = c.NextSibling
-	}
-	b.Write(endMarker)
-	b.Write(crnl)
-	return b.Flush()
+// HeaderEncoderFactory returns a newly instantiated HeaderEncoder
+type HeaderEncoderFactory func(e *Encoder, p *Part) (HeaderEncoder, error)
+
+type Encoder struct {
+	transferEncodingDeterminer func([]byte, bool) TransferEncoding
+	contentTypeDeterminer      func(*Part) bool
+	boundaryGenerator          func() string
+	headerEncoderFactory       HeaderEncoderFactory
 }
 
 // setupMIMEHeaders determines content transfer encoding, generates a boundary string if required,
 // then sets the Content-Type (type, charset, filename, boundary) and Content-Disposition headers.
-func (p *Part) setupMIMEHeaders() transferEncoding {
+func (e *Encoder) setupMIMEHeaders(p *Part) TransferEncoding {
 	// Determine content transfer encoding.
 
 	// If we are encoding a part that previously had content-transfer-encoding set, unset it so
 	// the correct encoding detection can be done below.
 	p.Header.Del(hnContentEncoding)
 
-	cte := te7Bit
+	cte := TE7Bit
 	if len(p.Content) > 0 {
-		cte = teBase64
-		if p.TextContent() {
-			cte = selectTransferEncoding(p.Content, false)
+		cte = TEBase64
+		if e.contentTypeDeterminer(p) {
+			cte = e.transferEncodingDeterminer(p.Content, false)
 			if p.Charset == "" {
 				p.Charset = utf8
 			}
 		}
 		// RFC 2045: 7bit is assumed if CTE header not present.
 		switch cte {
-		case teBase64:
+		case TEBase64:
 			p.Header.Set(hnContentEncoding, cteBase64)
-		case teQuoted:
+		case TEQuoted:
 			p.Header.Set(hnContentEncoding, cteQuotedPrintable)
 		}
 	}
 	// Setup headers.
 	if p.FirstChild != nil && p.Boundary == "" {
 		// Multipart, generate random boundary marker.
-		p.Boundary = "enmime-" + stringutil.UUID()
+		p.Boundary = e.boundaryGenerator()
 	}
 	if p.ContentID != "" {
 		p.Header.Set(hnContentID, coding.ToIDHeader(p.ContentID))
@@ -127,34 +102,75 @@ func (p *Part) setupMIMEHeaders() transferEncoding {
 	return cte
 }
 
+func (e *Encoder) Encode(p *Part, writer io.Writer) error {
+	if p.Header == nil {
+		p.Header = make(textproto.MIMEHeader)
+	}
+	cte := e.setupMIMEHeaders(p)
+	// Encode this part.
+	b := bufio.NewWriter(writer)
+	if err := e.encodeHeader(p, b); err != nil {
+		return err
+	}
+	if len(p.Content) > 0 {
+		b.Write(crnl)
+		if err := e.encodeContent(p, b, cte); err != nil {
+			return err
+		}
+	}
+	if p.FirstChild == nil {
+		return b.Flush()
+	}
+	// Encode children.
+	endMarker := []byte("\r\n--" + p.Boundary + "--")
+	marker := endMarker[:len(endMarker)-2]
+	c := p.FirstChild
+	for c != nil {
+		b.Write(marker)
+		b.Write(crnl)
+		if err := c.Encode(b); err != nil {
+			return err
+		}
+		c = c.NextSibling
+	}
+	b.Write(endMarker)
+	b.Write(crnl)
+	return b.Flush()
+}
+
 // encodeHeader writes out a sorted list of headers.
-func (p *Part) encodeHeader(b *bufio.Writer) {
+func (e *Encoder) encodeHeader(p *Part, b *bufio.Writer) error {
 	keys := make([]string, 0, len(p.Header))
 	for k := range p.Header {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	headerEncoder, err := e.headerEncoderFactory(e, p)
+	if err != nil {
+		return err
+	}
 	for _, k := range keys {
 		for _, v := range p.Header[k] {
-			encv := v
-			switch selectTransferEncoding([]byte(v), true) {
-			case teBase64:
-				encv = mime.BEncoding.Encode(utf8, v)
-			case teQuoted:
-				encv = mime.QEncoding.Encode(utf8, v)
+			// TODO: headerEncoder is expected to fold it. Should fix this later.
+			_, encv, err := headerEncoder.Encode(0, v)
+			if err != nil {
+				return err
 			}
 			// _ used to prevent early wrapping
 			wb := stringutil.Wrap(76, k, ":_", encv, "\r\n")
 			wb[len(k)+1] = ' '
-			b.Write(wb)
+			if _, err := b.Write(wb); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 // encodeContent writes out the content in the selected encoding.
-func (p *Part) encodeContent(b *bufio.Writer, cte transferEncoding) (err error) {
+func (e *Encoder) encodeContent(p *Part, b *bufio.Writer, cte TransferEncoding) (err error) {
 	switch cte {
-	case teBase64:
+	case TEBase64:
 		enc := base64.StdEncoding
 		text := make([]byte, enc.EncodedLen(len(p.Content)))
 		base64.StdEncoding.Encode(text, p.Content)
@@ -170,7 +186,7 @@ func (p *Part) encodeContent(b *bufio.Writer, cte transferEncoding) (err error) 
 			b.Write(crnl)
 			text = text[lineLen:]
 		}
-	case teQuoted:
+	case TEQuoted:
 		qp := quotedprintable.NewWriter(b)
 		if _, err = qp.Write(p.Content); err != nil {
 			return err
@@ -182,10 +198,10 @@ func (p *Part) encodeContent(b *bufio.Writer, cte transferEncoding) (err error) 
 	return err
 }
 
-// selectTransferEncoding scans content for non-ASCII characters and selects 'b' or 'q' encoding.
-func selectTransferEncoding(content []byte, quoteLineBreaks bool) transferEncoding {
+// SelectTransferEncoding scans content for non-ASCII characters and selects 'b' or 'q' encoding.
+func SelectTransferEncoding(content []byte, quoteLineBreaks bool) TransferEncoding {
 	if len(content) == 0 {
-		return te7Bit
+		return TE7Bit
 	}
 	// Binary chars remaining before we choose b64 encoding.
 	threshold := b64Percent * len(content) / 100
@@ -197,14 +213,14 @@ func selectTransferEncoding(content []byte, quoteLineBreaks bool) transferEncodi
 			}
 			bincount++
 			if bincount >= threshold {
-				return teBase64
+				return TEBase64
 			}
 		}
 	}
 	if bincount == 0 {
-		return te7Bit
+		return TE7Bit
 	}
-	return teQuoted
+	return TEQuoted
 }
 
 // setParamValue will ignore empty values
@@ -212,4 +228,67 @@ func setParamValue(p map[string]string, k, v string) {
 	if v != "" {
 		p[k] = v
 	}
+}
+
+type EncoderOption func(*Encoder) *Encoder
+
+func WithTransferEncodingDeterminer(det func([]byte, bool) TransferEncoding) EncoderOption {
+	return func(e *Encoder) *Encoder {
+		e.transferEncodingDeterminer = det
+		return e
+	}
+}
+
+func WithContentTypeDeterminer(det func(*Part) bool) EncoderOption {
+	return func(e *Encoder) *Encoder {
+		e.contentTypeDeterminer = det
+		return e
+	}
+}
+
+func WithHeaderEncoderFactory(f HeaderEncoderFactory) EncoderOption {
+	return func(e *Encoder) *Encoder {
+		e.headerEncoderFactory = f
+		return e
+	}
+}
+
+type flexibleHeaderEncoder struct {
+	*Encoder
+	p *Part
+}
+
+func (e *flexibleHeaderEncoder) Encode(startColumn int, v string) (int, string, error) {
+	cs := e.p.Charset
+	if cs == "" {
+		cs = utf8
+	}
+	switch e.transferEncodingDeterminer([]byte(v), true) {
+	case TEBase64:
+		v = mime.BEncoding.Encode(cs, v)
+	case TEQuoted:
+		v = mime.QEncoding.Encode(cs, v)
+	default:
+	}
+	return startColumn + len(v), v, nil
+}
+
+func newFlexibleHeaderEncoder(e *Encoder, p *Part) (HeaderEncoder, error) {
+	return &flexibleHeaderEncoder{e, p}, nil
+}
+
+func NewEncoder(options ...EncoderOption) *Encoder {
+	return &Encoder{
+		transferEncodingDeterminer: SelectTransferEncoding,
+		contentTypeDeterminer:      func(p *Part) bool { return p.TextContent() },
+		boundaryGenerator:          func() string { return "enmime-" + stringutil.UUID() },
+		headerEncoderFactory:       newFlexibleHeaderEncoder,
+	}
+}
+
+var DefaultEncoder = NewEncoder()
+
+// Encode writes this Part and all its children to the specified writer in MIME format.
+func (p *Part) Encode(writer io.Writer) error {
+	return DefaultEncoder.Encode(p, writer)
 }

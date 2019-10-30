@@ -22,9 +22,10 @@ type Envelope struct {
 	Inlines     []*Part // All parts having a Content-Disposition of inline
 	// All non-text parts that were not placed in Attachments or Inlines, such as multipart/related
 	// content.
-	OtherParts []*Part
-	Errors     []*Error              // Errors encountered while parsing
-	header     *textproto.MIMEHeader // Header from original message
+	OtherParts    []*Part
+	Errors        []*Error              // Errors encountered while parsing
+	header        *textproto.MIMEHeader // Header from original message
+	headerEncoder HeaderEncoder         // Preferred Header encoder
 }
 
 // GetHeaderKeys returns a list of header keys seen in this message. Get
@@ -72,10 +73,18 @@ func (e *Envelope) SetHeader(name string, value []string) error {
 
 	for i, v := range value {
 		if i == 0 {
-			e.header.Set(name, mime.BEncoding.Encode("utf-8", v))
+			encoded, err := e.encodeHeader(v)
+			if err != nil {
+				return err
+			}
+			e.header.Set(name, encoded)
 			continue
 		}
-		e.header.Add(name, mime.BEncoding.Encode("utf-8", v))
+		encoded, err := e.encodeHeader(v)
+		if err != nil {
+			return err
+		}
+		e.header.Add(name, encoded)
 	}
 	return nil
 }
@@ -87,7 +96,11 @@ func (e *Envelope) AddHeader(name string, value string) error {
 		return fmt.Errorf("Provide non-empty header name")
 	}
 
-	e.header.Add(name, mime.BEncoding.Encode("utf-8", value))
+	encoded, err := e.encodeHeader(value)
+	if err != nil {
+		return err
+	}
+	e.header.Add(name, encoded)
 	return nil
 }
 
@@ -148,8 +161,24 @@ func (e *Envelope) Clone() *Envelope {
 		e.OtherParts,
 		e.Errors,
 		e.header,
+		e.headerEncoder,
 	}
 	return newEnvelope
+}
+
+// encodeHeader() encodes the given mime header with the content encoding / charset associated to the encoder
+func (e *Envelope) encodeHeader(v string) (string, error) {
+	if e.headerEncoder == nil {
+		return mime.BEncoding.Encode(utf8, v), nil
+	} else {
+		_, encoded, err := e.headerEncoder.Encode(0, v)
+		return encoded, err
+	}
+}
+
+// SetHeaderEncoder() sets the encoder used to build headers in subsequent SetHeader() / AddHeader() operations
+func (e *Envelope) SetHeaderEncoder(encoder HeaderEncoder) {
+	e.headerEncoder = encoder
 }
 
 // ReadEnvelope is a wrapper around ReadParts and EnvelopeFromPart.  It parses the content of the
